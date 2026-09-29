@@ -24,7 +24,7 @@ Target::Target(
   t_(t)
 {
   auto r = radius > 0.0 ? radius : (armor.name == ArmorName::outpost ? 0.2765 : 0.2);
-  priority = armor.priority;
+  priority = ArmorPriority::first;
   const Eigen::VectorXd & xyz = armor.xyz_in_world;
   const Eigen::VectorXd & ypr = armor.ypr_in_world;
 
@@ -40,13 +40,11 @@ Target::Target(
   // l: dh1 for outpost / r2 - r1 for vehicles
   // h: dh2 for outpost / z2 - z1 for vehicles
   Eigen::VectorXd x0{{center_x, 0, center_y, 0, center_z, 0, ypr[0], 0, r, 0, 0}};  //初始化预测量
-  Eigen::VectorXd P0_dig_car{
-    {1, 64, 1, 64, 1, 64, 0.4, 100, 0, 0,
-     0}};  // Task_2 TODO: 根据实际情况，调整“后三项”预测量协方差矩阵参数
-
-  // Task_3 TODO: 为前哨站建立专有的初始状预测量及其协方差矩阵参数（P0_dig_outpost）
-
-  Eigen::Matrix<double, 11, 11> P0 = P0_dig_car.asDiagonal();
+  // 几何量初值来自第一块装甲板，换板后再逐渐估计另一半径和高度差。
+  Eigen::VectorXd P0_dig_car{{1, 64, 1, 64, 1, 64, 0.4, 100, 0.0025, 0.01, 0.01}};
+  Eigen::VectorXd P0_dig_outpost{{0.25, 1, 0.25, 1, 0.25, 1, 0.4, 25, 0.0004, 0.01, 0.01}};
+  Eigen::Matrix<double, 11, 11> P0 =
+    (is_layered_outpost() ? P0_dig_outpost : P0_dig_car).asDiagonal();
 
   // 防止夹角求和出现异常值
   auto x_add = [](const Eigen::VectorXd & a, const Eigen::VectorXd & b) -> Eigen::VectorXd {
@@ -88,10 +86,9 @@ void Target::predict(double dt)
   // https://github.com/rlabbe/Kalman-and-Bayesian-Filters-in-Python/blob/master/07-Kalman-Filter-Math.ipynb
   double v1, v2;
 
-  // Task_2 TODO: 根据实际情况，调整v1与v2
-  v1 = 1;           // 加速度方差
-  v2 = 1;           // 角加速度方差
-  double v1_z = 1;  // z轴加速度方差
+  v1 = is_layered_outpost() ? 0.05 : 4.0;  // 平移加速度方差
+  v2 = is_layered_outpost() ? 4.0 : 16.0;  // 角加速度方差
+  double v1_z = is_layered_outpost() ? 0.05 : 2.0;
 
   auto a = dt * dt * dt * dt / 4;
   auto b = dt * dt * dt / 2;
@@ -242,7 +239,11 @@ bool Target::diverged() const
 {
   auto r_ok = ekf_.x[8] > 0.05 && ekf_.x[8] < 0.5;
 
-  //Task_3 TODO: 为前哨站建立专有的发散判定条件
+  if (is_layered_outpost()) {
+    // 前哨站只有一个半径；x[9] 和 x[10] 是另外两块板的高度差。
+    return !r_ok || !std::isfinite(ekf_.x[9]) || !std::isfinite(ekf_.x[10]) ||
+           std::abs(ekf_.x[9]) > 0.5 || std::abs(ekf_.x[10]) > 0.5;
+  }
 
   auto l_ok = ekf_.x[8] + ekf_.x[9] > 0.05 && ekf_.x[8] + ekf_.x[9] < 0.5;
 
@@ -275,8 +276,8 @@ Eigen::Vector3d Target::h_armor_xyz(const Eigen::VectorXd & x, int id) const
   auto armor_x = x[0] - r * std::cos(angle);
   auto armor_y = x[2] - r * std::sin(angle);
 
-  double dh = 0.0;  // 高度差
-  // Task_3 TODO: 为前哨站建立专有的高度差计算方法
+  double dh = use_outpost_h ? (id == 1 ? x[9] : (id == 2 ? x[10] : 0.0))
+                            : (use_l_h ? x[10] : 0.0);
 
   auto armor_z = x[4] + dh;  //task_3 tips
 
@@ -298,16 +299,14 @@ Eigen::MatrixXd Target::h_jacobian(const Eigen::VectorXd & x, int id) const
   auto dx_dl = (use_l_h) ? -std::cos(angle) : 0.0;
   auto dy_dl = (use_l_h) ? -std::sin(angle) : 0.0;
 
-  auto dz_dh = use_l_h ? 1.0 : 0.0;
-
-  //  Task_3 tips:
-  // auto dz_dl = 0.0; // Task_3 TODO: 为前哨站建立专有的雅各比阵计算方法
+  auto dz_dl = use_outpost_h && id == 1 ? 1.0 : 0.0;
+  auto dz_dh = (use_outpost_h && id == 2) || use_l_h ? 1.0 : 0.0;
 
   // clang-format off
   Eigen::MatrixXd H_armor_xyza{
     {1, 0, 0, 0, 0, 0, dx_da, 0, dx_dr, dx_dl,     0},
     {0, 0, 1, 0, 0, 0, dy_da, 0, dy_dr, dy_dl,     0},
-    {0, 0, 0, 0, 1, 0,     0, 0,     0,     0, dz_dh},
+    {0, 0, 0, 0, 1, 0,     0, 0,     0, dz_dl, dz_dh},
     {0, 0, 0, 0, 0, 0,     1, 0,     0,     0,     0}
   };
   // clang-format on
